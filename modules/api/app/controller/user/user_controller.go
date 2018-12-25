@@ -16,6 +16,7 @@ package user
 
 import (
 	"fmt"
+	//"math"
 	"net/http"
 	"strconv"
 	"time"
@@ -26,6 +27,8 @@ import (
 	f "github.com/open-falcon/falcon-plus/modules/api/app/model/falcon_portal"
 	"github.com/open-falcon/falcon-plus/modules/api/app/pkg/app"
 	"github.com/open-falcon/falcon-plus/modules/api/app/pkg/e"
+	"github.com/open-falcon/falcon-plus/modules/api/app/pkg/util"
+	"github.com/uniplaces/carbon"
 )
 
 func GetUserList(c *gin.Context) {
@@ -184,7 +187,7 @@ func CreateUser(c *gin.Context) {
 }
 
 type APIUpdateUserInputs struct {
-	ID                 string  `json:"id" binding:"required"`
+	ID                 int64   `json:"id" binding:"required"`
 	BorrowUser         string  `json:"borrow_user"`
 	BorrowPhone        string  `json:"borrow_phone"`
 	MateUser           string  `json:"mate_user"`
@@ -273,7 +276,7 @@ func UpdateUser(c *gin.Context) {
 		Other2:             inputs.Other2,
 		State:              2,
 	}
-	if dt := db.Falcon.Where("id = ?", inputs.ID).Update(uuser).Find(&user); dt.Error != nil {
+	if dt := db.Falcon.Table("user").Where("id = ?", inputs.ID).Update(uuser).Find(&user); dt.Error != nil {
 		appG.Response(http.StatusOK, e.ERROR_EDIT_USER_FAIL, dt.Error.Error())
 		return
 	}
@@ -294,7 +297,9 @@ func DeleteUser(c *gin.Context) {
 		return
 	}
 	user := f.User{Id: int64(nid)}
-	if dt := db.Falcon.Delete(&user); dt.Error != nil {
+	db.Falcon.First(&user)
+
+	if dt := db.Falcon.Where("id = ?", nid).Delete(&f.User{}); dt.Error != nil {
 		appG.Response(http.StatusOK, e.ERROR_DELETE_USER_FAIL, dt.Error.Error())
 		return
 	}
@@ -311,32 +316,252 @@ func GetUserLists(c *gin.Context) {
 	)
 	pageTmp := c.DefaultQuery("page", "")
 	limitTmp := c.DefaultQuery("limit", "")
+	stateTmp := c.DefaultQuery("state", "")
 	page, limit, err = h.PageParser(pageTmp, limitTmp)
 	if err != nil {
 		appG.Response(http.StatusOK, e.INVALID_PARAMS, err.Error())
 		return
 	}
-	var dt *gorm.DB
+
+	if limit != -1 && page != -1 {
+	} else {
+		page = 1
+		limit = 2000
+	}
+
+	dt := db.Falcon
+	if stateTmp == "" {
+	} else {
+		if state, err := strconv.Atoi(stateTmp); err != nil {
+			appG.Response(http.StatusOK, e.INVALID_PARAMS, err.Error())
+			return
+		} else {
+			dt = dt.Where("state = ?", state)
+		}
+	}
+
 	users := []f.User{}
 
-	var count int
-	if err := db.Falcon.Model(&f.User{}).Count(&count).Error; err != nil {
-		count = 0
+	order_by := []string{"id desc"}
+	paginator := util.Paginator{
+		DB:      dt,
+		OrderBy: order_by,
+		Page:    strconv.Itoa(page),
+		PerPage: strconv.Itoa(limit),
+	}
+
+	data := paginator.Paginate(&users)
+
+	appG.Response(http.StatusOK, e.SUCCESS, map[string]interface{}{
+		"lists": data.Records,
+		"total": data.TotalRecords,
+	})
+	return
+}
+
+type APIUpdateUserStatus struct {
+	ID    int64 `json:"id"`
+	State int   `json:"state"`
+}
+
+func UpdateStatus(c *gin.Context) {
+	appG := app.Gin{C: c}
+
+	var inputs APIUpdateUserStatus
+	if err := c.Bind(&inputs); err != nil {
+		appG.Response(http.StatusOK, e.INVALID_PARAMS, err.Error())
+		return
+	}
+
+	var user f.User
+	db.Falcon.Table("user").Where("id = ?", inputs.ID).First(&user)
+
+	//状态机的判断,仅仅支持　2->1;1->0;0->1
+	if !((user.State == 2 && inputs.State == 1) || (user.State == 1 && inputs.State == 0) || (user.State == 0 && inputs.State == 1)) {
+		appG.Response(http.StatusOK, e.INVALID_PARAMS, "状态转换异常")
+		return
+	}
+
+	tx := db.Falcon.Begin()
+	if user.State == 2 && inputs.State == 1 {
+
+		now := time.Now()
+		year := now.Year()
+		month := now.Month()
+		date := now.Day()
+		//hour := now.Hour()
+		t1, _ := carbon.Create(year, month, date, 8, 0, 0, 0, "UTC")
+
+		for i := 0; i < user.LoanPeriods; i++ {
+
+			t1 = t1.AddMonth()
+
+			if err := tx.Create(&f.Repay{
+				Number:           fmt.Sprintf("%d", i+1),
+				CurrentPrincipal: user.LoanStillPrincipal,
+				CurrentInterest:  user.LoanStillRate,
+				ShouldDate:       t1.Time,
+				RealPrincipal:    float32(0),
+				RealInterest:     float32(0),
+				RealDate:         nil,
+				UserID:           user.Id,
+			}).Error; err != nil {
+				tx.Rollback()
+				appG.Response(http.StatusOK, e.INVALID_PARAMS, "状态转换异常")
+				return
+			}
+		}
+	}
+
+	if user.State == 1 && inputs.State == 0 {
+	}
+
+	if user.State == 0 && inputs.State == 1 {
+	}
+	tx.Commit()
+
+	if dt := db.Falcon.Table("user").Where("id = ?", inputs.ID).Select("state").Updates(map[string]interface{}{"state": inputs.State}); dt.Error != nil {
+		appG.Response(http.StatusOK, e.ERROR_DELETE_USER_FAIL, dt.Error.Error())
+		return
+	}
+	db.Falcon.Table("user").Where("id = ?", inputs.ID).First(&user)
+	appG.Response(http.StatusOK, e.SUCCESS, user)
+	return
+
+}
+
+func GetRepay(c *gin.Context) {
+	appG := app.Gin{C: c}
+
+	nidtmp := c.Params.ByName("rid")
+	if nidtmp == "" {
+		appG.Response(http.StatusOK, e.INVALID_PARAMS, "rid is missing")
+		return
+	}
+	nid, err := strconv.Atoi(nidtmp)
+	if err != nil {
+		appG.Response(http.StatusOK, e.INVALID_PARAMS, err.Error())
+		return
+	}
+	repay := f.Repay{ID: int64(nid)}
+	if dt := db.Falcon.Find(&repay); dt.Error != nil {
+		appG.Response(http.StatusOK, e.ERROR_GET_REPAY_FAIL, dt.Error.Error())
+		return
+	}
+	appG.Response(http.StatusOK, e.SUCCESS, repay)
+	return
+}
+
+func GetUserRepay(c *gin.Context) {
+	appG := app.Gin{C: c}
+
+	var (
+		limit int
+		page  int
+		err   error
+	)
+	pageTmp := c.DefaultQuery("page", "")
+	limitTmp := c.DefaultQuery("limit", "")
+	page, limit, err = h.PageParser(pageTmp, limitTmp)
+	if err != nil {
+		appG.Response(http.StatusOK, e.INVALID_PARAMS, err.Error())
+		return
 	}
 
 	if limit != -1 && page != -1 {
-		dt = db.Falcon.Raw(fmt.Sprintf("SELECT * from cost limit %d,%d", page, limit)).Scan(&users)
 	} else {
-		dt = db.Falcon.Find(&users)
+		page = 1
+		limit = 2000
 	}
-	if dt.Error != nil {
+
+	uidtmp := c.Params.ByName("uid")
+	if uidtmp == "" {
+		appG.Response(http.StatusOK, e.INVALID_PARAMS, "uid is missing")
+		return
+	}
+	uid, err := strconv.Atoi(uidtmp)
+	if err != nil {
+		appG.Response(http.StatusOK, e.INVALID_PARAMS, err.Error())
+		return
+	}
+
+	var count int
+	if dt := db.Falcon.Table("user").Where("id = ?", uid).Count(&count); dt.Error != nil {
 		appG.Response(http.StatusOK, e.ERROR_GET_USER_FAIL, dt.Error.Error())
 		return
 	}
 
+	if count != 1 {
+		appG.Response(http.StatusOK, e.ERROR_GET_USER_FAIL, "不存在该用户偿还记录")
+		return
+	}
+
+	var repays []f.Repay
+	dt := db.Falcon.Table("repay").Where("user_id = ?", uid)
+	if dt.Error != nil {
+		appG.Response(http.StatusOK, e.ERROR_GET_REPAYS_FAIL, dt.Error.Error())
+		return
+	}
+
+	order_by := []string{}
+	paginator := util.Paginator{
+		DB:      dt,
+		OrderBy: order_by,
+		Page:    strconv.Itoa(page),
+		PerPage: strconv.Itoa(limit),
+	}
+
+	data := paginator.Paginate(&repays)
+
 	appG.Response(http.StatusOK, e.SUCCESS, map[string]interface{}{
-		"lists": users,
-		"total": count,
+		"lists": data.Records,
+		"total": data.TotalRecords,
 	})
+	return
+}
+
+type APIUpdateRepayInput struct {
+	ID            int64   `json:"id" binding:"required"`
+	RealPrincipal float32 `json:"real_principal" binding:"required"`
+	RealInterest  float32 `json:"real_interest" binding:"required"`
+	RealDate      int64   `json:"real_date" binding:"required"`
+}
+
+func UpdateRepay(c *gin.Context) {
+	appG := app.Gin{C: c}
+
+	var inputs APIUpdateRepayInput
+	if err := c.Bind(&inputs); err != nil {
+		appG.Response(http.StatusOK, e.INVALID_PARAMS, err.Error())
+		return
+	}
+
+	var count int
+	if dt := db.Falcon.Table("repay").Where("id = ?", inputs.ID).Count(&count); dt.Error != nil {
+		appG.Response(http.StatusOK, e.ERROR_GET_REPAY_FAIL, dt.Error.Error())
+		return
+	}
+
+	if count != 1 {
+		appG.Response(http.StatusOK, e.ERROR_GET_USER_FAIL, "不存在该用户偿还记录")
+		return
+	}
+
+	if dt := db.Falcon.Table("repay").Where("id = ?", inputs.ID).Select("real_principal, real_interest, real_date").Updates(map[string]interface{}{
+		"real_principal": inputs.RealPrincipal,
+		"real_interest":  inputs.RealInterest,
+		"real_date":      time.Unix(inputs.RealDate, 0),
+	}); dt.Error != nil {
+		appG.Response(http.StatusOK, e.ERROR_DELETE_USER_FAIL, dt.Error.Error())
+		return
+	}
+	var repay f.Repay
+	dt := db.Falcon.Table("repay").First(&repay, inputs.ID)
+	if dt.Error != nil {
+		appG.Response(http.StatusOK, e.ERROR_GET_REPAYS_FAIL, dt.Error.Error())
+		return
+	}
+
+	appG.Response(http.StatusOK, e.SUCCESS, repay)
 	return
 }

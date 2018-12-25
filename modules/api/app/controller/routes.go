@@ -23,11 +23,11 @@ import (
 	"github.com/open-falcon/falcon-plus/modules/api/app/controller/user"
 	"github.com/open-falcon/falcon-plus/modules/api/app/pkg/export"
 	"github.com/open-falcon/falcon-plus/modules/api/app/pkg/upload"
-	"github.com/open-falcon/falcon-plus/modules/api/app/utils"
+	"github.com/open-falcon/falcon-plus/modules/api/app/pkg/util"
 )
 
 func StartGin(port string, r *gin.Engine) {
-	r.Use(utils.CORS())
+	r.Use(util.CORS())
 	r.GET("/", func(c *gin.Context) {
 		c.String(http.StatusOK, "Hello, I'm Falcon+ (｡A｡)")
 	})

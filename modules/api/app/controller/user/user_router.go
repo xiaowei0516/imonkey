@@ -40,4 +40,15 @@ func Routes(r *gin.Engine) {
 	u.DELETE("/:nid", DeleteUser)
 	//获取所有用户列表
 	u.GET("", GetUserLists)
+
+	//更改客户状态，从潜在客户到当前客户
+	u.POST("/updateState", UpdateStatus)
+
+	rep := r.Group("/api/v1/repay")
+	//修改偿还记录
+	rep.PUT("/", UpdateRepay)
+	//获取某个用户的偿还记录
+	rep.GET("/user/:uid", GetUserRepay)
+	//根据ID获取偿还记录
+	rep.GET("/repay/:rid", GetRepay)
 }
